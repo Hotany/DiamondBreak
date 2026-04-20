@@ -9,7 +9,8 @@ from streamlit_drawable_canvas import st_canvas
 
 
 DATA_FILE = Path("datasource01.xlsx")
-DEFAULT_FIELD_IMAGE = Path("baseball-field-diagram.png")
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_FIELD_IMAGE = BASE_DIR / "baseball-field-diagram.png"
 
 
 REQUIRED_COLUMNS = [
@@ -124,9 +125,19 @@ def load_scenarios(excel_path: Path) -> pd.DataFrame:
 def resolve_background_image(row: pd.Series):
     image_hint = str(row.get("Tactical Image", "")).strip()
     if image_hint:
-        p = Path(image_hint)
-        if p.exists() and p.is_file():
-            return Image.open(p)
+        raw = Path(image_hint)
+        candidates = []
+
+        if raw.is_absolute():
+            candidates.append(raw)
+            # 云端回退：当 Excel 存的是本地绝对路径时，尝试同名文件
+            candidates.append(BASE_DIR / raw.name)
+        else:
+            candidates.append(BASE_DIR / raw)
+
+        for p in candidates:
+            if p.exists() and p.is_file():
+                return Image.open(p)
 
     if DEFAULT_FIELD_IMAGE.exists() and DEFAULT_FIELD_IMAGE.is_file():
         return Image.open(DEFAULT_FIELD_IMAGE)
@@ -454,11 +465,17 @@ def main():
     st.set_page_config(page_title="Baseball Tactical Trainer", layout="wide")
     ensure_state()
 
-    if not DATA_FILE.exists():
+    data_file_path = BASE_DIR / DATA_FILE
+    if not data_file_path.exists():
         st.error("未找到数据文件 `datasource01.xlsx`。请将它放到项目根目录。")
+        with st.expander("部署环境诊断", expanded=False):
+            st.write(f"当前目录: `{Path.cwd()}`")
+            st.write(f"应用目录: `{BASE_DIR}`")
+            st.write(f"期望数据文件: `{data_file_path}`")
+            st.write(f"期望底图文件: `{DEFAULT_FIELD_IMAGE}`")
         return
 
-    df = load_scenarios(DATA_FILE)
+    df = load_scenarios(data_file_path)
     if st.session_state.selected_id is None:
         show_dashboard(df)
     else:
