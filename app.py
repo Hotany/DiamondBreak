@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import math
 import io
+import os
 
 import pandas as pd
 import streamlit as st
@@ -539,7 +540,8 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
     if render_scale > 1:
         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         final_image = final_image.resize((canvas_width, canvas_height), resample=resampling)
-    return final_image, entities, ball_paths, runner_paths
+    # Cloud compatibility: drawable-canvas is more stable with RGB than RGBA backgrounds.
+    return final_image.convert("RGB"), entities, ball_paths, runner_paths
 
 
 def ensure_state():
@@ -606,6 +608,11 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
     st.write(row["Description"] or "（暂无）")
     st.markdown("### 向你提问")
     st.write(row["Key Question"] or "（暂无）")
+
+    with st.expander("云端渲染诊断", expanded=False):
+        st.write(f"streamlit: `{st.__version__}`")
+        st.write(f"streamlit sharing mode: `{os.environ.get('STREAMLIT_SHARING_MODE', 'unknown')}`")
+        st.write("若画布空白，请到 Streamlit Cloud Logs 搜索 `drawable-canvas` / `Failed to load component`。")
 
     st.markdown("### 交互式战术板")
     viewport_width = streamlit_js_eval(
@@ -677,7 +684,7 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         with c4:
             if canvas_result is not None and canvas_result.image_data is not None:
                 png_io = io.BytesIO()
-                Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA").save(png_io, format="PNG")
+                Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
                 st.download_button(
                     "下载当前标注图(PNG)",
                     data=png_io.getvalue(),
@@ -716,7 +723,7 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
             )
             if canvas_result is not None and canvas_result.image_data is not None:
                 png_io = io.BytesIO()
-                Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA").save(png_io, format="PNG")
+                Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
                 st.download_button(
                     "下载当前标注图(PNG)",
                     data=png_io.getvalue(),
