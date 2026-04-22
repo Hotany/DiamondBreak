@@ -1,5 +1,7 @@
 from pathlib import Path
 import re
+import math
+import io
 
 import pandas as pd
 import streamlit as st
@@ -10,7 +12,6 @@ from streamlit_drawable_canvas import st_canvas
 
 DATA_FILE = Path("datasource01.xlsx")
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_FIELD_IMAGE = BASE_DIR / "baseball-field-diagram.png"
 
 
 REQUIRED_COLUMNS = [
@@ -25,25 +26,44 @@ REQUIRED_COLUMNS = [
 ]
 
 BASE_CANVAS_WIDTH = 800
-BASE_CANVAS_HEIGHT = 500
+BASE_CANVAS_HEIGHT = 800
 CANVAS_ASPECT_RATIO = BASE_CANVAS_HEIGHT / BASE_CANVAS_WIDTH
+RENDER_SUPERSAMPLE = 2
+FENCE_SAMPLE_STEP_DEG = 0.5
+BOUNDARY_SAMPLE_STEP_DEG = 1.0
 
-# 以 800x500 画布为基准的粗略球场坐标，适配常见的上半场区在上、内野菱形在中部的底图。
+# 基于棒球常见尺寸（单位：英尺）
+BASE_PATH_FT = 90.0
+PITCH_DISTANCE_FT = 60.5  # 60'6"
+INFIELD_ARC_FT = 95.0
+FOUL_DISTANCE_FT = 330.0
+CENTER_ALLEY_FT = 375.0
+CENTER_FIELD_FT = 400.0
+OUTFIELD_ARC_RADIUS_FT = 380.0
+OUTFIELD_ARC_CURVATURE_SCALE = 1.15
+INFIELD_ARC_CURVATURE_SCALE = OUTFIELD_ARC_CURVATURE_SCALE
+DIAMOND_SCALE = 0.85
+HALF_DIAMOND = BASE_PATH_FT / math.sqrt(2.0)
+BASE_DISTANCE_SCALE = 1.8
+BASE_COORD_HALF = HALF_DIAMOND * BASE_DISTANCE_SCALE
+INFIELD_FAN_RADIUS_SCALE = 1.26
+
+# 以本垒为原点的近似实地坐标（英尺）：x 向右，y 向外场
 POSITION_COORDS = {
-    "P": (400, 300),   # 投手
-    "C": (400, 435),   # 捕手
-    "1B": (510, 345),
-    "2B": (400, 250),
-    "3B": (290, 345),
-    "SS": (340, 275),
-    "LF": (220, 180),
-    "CF": (400, 130),
-    "RF": (580, 180),
-    "B": (400, 455),   # 打者
-    "R1": (535, 365),  # 一垒跑者
-    "R2": (400, 230),  # 二垒跑者
-    "R3": (265, 365),  # 三垒跑者
-    "H": (400, 400),   # 本垒(传球目标)
+    "H": (0.0, 0.0),                         # 本垒
+    "B": (0.0, -8.0),                        # 打者
+    "C": (0.0, -18.0),                       # 捕手
+    "P": (0.0, PITCH_DISTANCE_FT * BASE_DISTANCE_SCALE),  # 投手（按倍率放大）
+    "1B": (BASE_COORD_HALF, BASE_COORD_HALF),      # 一垒（放大到 2x）
+    "2B": (0.0, 2 * BASE_COORD_HALF),              # 二垒（放大到 2x）
+    "3B": (-BASE_COORD_HALF, BASE_COORD_HALF),     # 三垒（放大到 2x）
+    "SS": (-35.0, 95.0),                     # 游击
+    "LF": (-190.0, 220.0),                   # 左外野
+    "CF": (0.0, 280.0),                      # 中外野
+    "RF": (190.0, 220.0),                    # 右外野
+    "R1": (BASE_COORD_HALF + 8.0, BASE_COORD_HALF + 6.0),
+    "R2": (0.0, 2 * BASE_COORD_HALF - 8.0),
+    "R3": (-BASE_COORD_HALF - 8.0, BASE_COORD_HALF + 6.0),
 }
 
 ENTITY_PATTERNS = {
@@ -92,6 +112,20 @@ LABELS = {
 DEFENDER_KEYS = ["P", "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF"]
 
 
+def sample_angles(start_deg: float, end_deg: float, step_deg: float):
+    if step_deg <= 0:
+        return [start_deg, end_deg]
+    count = int(round((end_deg - start_deg) / step_deg))
+    return [start_deg + i * step_deg for i in range(count + 1)]
+
+
+def smooth_lerp(v0: float, v1: float, t: float) -> float:
+    t = max(0.0, min(1.0, t))
+    # Cosine easing gives C1-like smooth visual transition between segments.
+    eased = (1.0 - math.cos(math.pi * t)) / 2.0
+    return v0 + (v1 - v0) * eased
+
+
 @st.cache_data
 def load_scenarios(excel_path: Path) -> pd.DataFrame:
     df = pd.read_excel(excel_path)
@@ -122,27 +156,219 @@ def load_scenarios(excel_path: Path) -> pd.DataFrame:
     return df
 
 
-def resolve_background_image(row: pd.Series):
-    image_hint = str(row.get("Tactical Image", "")).strip()
-    if image_hint:
-        raw = Path(image_hint)
-        candidates = []
+def draw_rotated_square(draw: ImageDraw.ImageDraw, center, size, fill, outline):
+    cx, cy = center
+    s = size
+    points = [(cx, cy - s), (cx + s, cy), (cx, cy + s), (cx - s, cy)]
+    draw.polygon(points, fill=fill, outline=outline)
 
-        if raw.is_absolute():
-            candidates.append(raw)
-            # 云端回退：当 Excel 存的是本地绝对路径时，尝试同名文件
-            candidates.append(BASE_DIR / raw.name)
+
+def load_label_font(size: int):
+    try:
+        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def draw_bold_text(draw: ImageDraw.ImageDraw, xy, text: str, font, fill):
+    x, y = xy
+    for dx, dy in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        draw.text((x + dx, y + dy), text, fill=fill, font=font)
+
+
+def scale_polygon(points, center, scale):
+    cx, cy = center
+    return [(cx + (x - cx) * scale, cy + (y - cy) * scale) for x, y in points]
+
+
+def outfield_radius_ft(theta_deg: float) -> float:
+    """Standard outfield arc with a single radius (visually smooth circular top)."""
+    _ = theta_deg
+    return OUTFIELD_ARC_RADIUS_FT
+
+
+def outfield_point_ft(theta_deg: float):
+    rad = math.radians(theta_deg)
+    r = outfield_radius_ft(theta_deg)
+    return fan_point_ft(theta_deg, r, OUTFIELD_ARC_CURVATURE_SCALE)
+
+
+def fan_point_ft(theta_deg: float, radius_ft: float, curvature_scale: float):
+    rad = math.radians(theta_deg)
+    x = radius_ft * math.sin(rad)
+    # 仅抬高中间弧顶（theta=0），在两端(theta=±45)保持不变，保证扇形仍为 90°
+    t = abs(theta_deg) / 45.0
+    bulge_weight = max(0.0, 1.0 - t * t)  # center=1, edge=0
+    y = radius_ft * math.cos(rad) * (1.0 + (curvature_scale - 1.0) * bulge_weight)
+    return x, y
+
+
+def build_canvas_projector(canvas_width: int, canvas_height: int):
+    field_points = list(POSITION_COORDS.values())
+    # 加入外场围栏采样点，确保整个球场轮廓都在可视正方形内
+    for deg in sample_angles(-45.0, 45.0, BOUNDARY_SAMPLE_STEP_DEG):
+        x, y = outfield_point_ft(float(deg))
+        field_points.append((x, y))
+
+    xs = [v[0] for v in field_points]
+    ys = [v[1] for v in field_points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    content_w = max(max_x - min_x, 1.0)
+    content_h = max(max_y - min_y, 1.0)
+    content_size = max(content_w, content_h)
+
+    padding = 24
+    square_size = max(220.0, min(canvas_width, canvas_height) - padding * 2)
+    scale = square_size / content_size
+
+    content_cx = (min_x + max_x) / 2.0
+    content_cy = (min_y + max_y) / 2.0
+    canvas_cx = canvas_width / 2.0
+    canvas_cy = canvas_height / 2.0
+
+    def project(key_or_point):
+        if isinstance(key_or_point, str):
+            sx, sy = POSITION_COORDS[key_or_point]
         else:
-            candidates.append(BASE_DIR / raw)
+            sx, sy = key_or_point
+        px = (sx - content_cx) * scale + canvas_cx
+        # 屏幕坐标 y 轴向下，球场逻辑 y 轴向上（外场在上方）需反转
+        py = (content_cy - sy) * scale + canvas_cy
+        return px, py
 
-        for p in candidates:
-            if p.exists() and p.is_file():
-                return Image.open(p)
+    return project, scale
 
-    if DEFAULT_FIELD_IMAGE.exists() and DEFAULT_FIELD_IMAGE.is_file():
-        return Image.open(DEFAULT_FIELD_IMAGE)
 
-    return None
+def draw_field_base(canvas_width: int, canvas_height: int, project, scale):
+    grass_main = (66, 140, 66, 255)   # #428c42
+    grass_inner = (66, 140, 66, 255)  # #428c42
+    dirt = (206, 156, 99, 255)        # #ce9c63
+    dirt_dark = (174, 142, 96, 255)
+    line = (245, 245, 245, 255)
+    outline = (45, 95, 45, 255)
+
+    # 底色白色，满足“图最底下背景色为白色”
+    field = Image.new("RGBA", (canvas_width, canvas_height), (255, 255, 255, 255))
+    draw = ImageDraw.Draw(field, "RGBA")
+
+    home = project("H")
+    first = project("1B")
+    second = project("2B")
+    third = project("3B")
+    lf = project("LF")
+    cf = project("CF")
+    rf = project("RF")
+    pitcher = project("P")
+
+    # 真实感外场：330-375-400-375-330 轮廓 + warning track
+    playable_arc = []
+    fence_arc_outer = []
+    fence_arc_inner = []
+    warning_track_ft = 12.0
+    for deg in sample_angles(-45.0, 45.0, FENCE_SAMPLE_STEP_DEG):
+        x_out, y_out = outfield_point_ft(float(deg))
+        r_outer = outfield_radius_ft(float(deg))
+        r_inner = max(r_outer - warning_track_ft, 200.0)
+        ratio = r_inner / max(r_outer, 1.0)
+        x_play = x_out * ratio
+        y_play = y_out * ratio
+        x_in = x_out * ratio
+        y_in = y_out * ratio
+        playable_arc.append(project((x_play, y_play)))
+        fence_arc_outer.append(project((x_out, y_out)))
+        fence_arc_inner.append(project((x_in, y_in)))
+
+    draw.polygon([home] + playable_arc, fill=grass_inner, outline=outline)
+    draw.polygon(fence_arc_outer + list(reversed(fence_arc_inner)), fill=dirt_dark, outline=outline)
+
+    # 内场土区：使用与外场相同的轮廓函数做缩放，保持形状一致
+    home_to_second_ft = math.dist(POSITION_COORDS["H"], POSITION_COORDS["2B"])
+    target_center_radius_ft = home_to_second_ft * INFIELD_FAN_RADIUS_SCALE
+    infield_shape_scale = target_center_radius_ft / CENTER_FIELD_FT
+    infield_fan_pts = []
+    for deg in sample_angles(-45.0, 45.0, FENCE_SAMPLE_STEP_DEG):
+        x_out, y_out = fan_point_ft(float(deg), OUTFIELD_ARC_RADIUS_FT, INFIELD_ARC_CURVATURE_SCALE)
+        x = x_out * infield_shape_scale
+        y = y_out * infield_shape_scale
+        infield_fan_pts.append(project((x, y)))
+    draw.polygon([home] + infield_fan_pts, fill=dirt)
+
+    # 本垒区土圈（半径扩大到 1.5 倍）
+    plate_circle_r = int(max(16, int(scale * 18)) * 1.5)
+    draw.ellipse(
+        (home[0] - plate_circle_r, home[1] - plate_circle_r, home[0] + plate_circle_r, home[1] + plate_circle_r),
+        fill=dirt,
+    )
+
+    # Diamond：本垒-一二三垒之间的中间正方形区域（按中心缩放）
+    diamond_pts = [home, first, second, third]
+    diamond_center = (
+        sum(p[0] for p in diamond_pts) / 4.0,
+        sum(p[1] for p in diamond_pts) / 4.0,
+    )
+    diamond_scaled_pts = scale_polygon(diamond_pts, diamond_center, DIAMOND_SCALE)
+    draw.polygon(diamond_scaled_pts, fill=grass_main, outline=outline)
+
+    # 投手丘（土色）
+    mound_r = max(8, int(scale * 9))
+    draw.ellipse(
+        (pitcher[0] - mound_r, pitcher[1] - mound_r, pitcher[0] + mound_r, pitcher[1] + mound_r),
+        fill=dirt,
+        outline=outline,
+    )
+
+    # 界线
+    draw.line([home, project(outfield_point_ft(-45.0))], fill=line, width=2)
+    draw.line([home, project(outfield_point_ft(45.0))], fill=line, width=2)
+    # 基线白线（更接近示例图风格）
+    baseline_w = max(2, int(scale * 1.2))
+    draw.line([home, first], fill=line, width=baseline_w)
+    draw.line([home, third], fill=line, width=baseline_w)
+    # 按需求去掉一垒-二垒、二垒-三垒白线
+
+    # 垒垫（白色）
+    base_size = max(5, int(scale * 1.3 * 0.9))
+    draw_rotated_square(draw, first, base_size, fill=line, outline=(215, 215, 215, 255))
+    draw_rotated_square(draw, second, base_size, fill=line, outline=(215, 215, 215, 255))
+    draw_rotated_square(draw, third, base_size, fill=line, outline=(215, 215, 215, 255))
+
+    # 本垒（白色五边形）
+    hx, hy = home
+    home_size = max(7, int(scale * 1.7))
+    home_plate = [
+        (hx - home_size, hy),
+        (hx + home_size, hy),
+        (hx + int(home_size * 0.8), hy + home_size),
+        (hx, hy + int(home_size * 1.5)),
+        (hx - int(home_size * 0.8), hy + home_size),
+    ]
+    draw.polygon(home_plate, fill=line, outline=(215, 215, 215, 255))
+
+    # 打击区与捕手区（线框）
+    box_w = max(8, int(scale * 5))
+    box_h = max(12, int(scale * 9))
+    gap = max(4, int(scale * 2.5))
+    draw.rectangle(
+        (home[0] - gap - box_w, home[1] - box_h, home[0] - gap, home[1] + box_h),
+        outline=line,
+        width=2,
+    )
+    draw.rectangle(
+        (home[0] + gap, home[1] - box_h, home[0] + gap + box_w, home[1] + box_h),
+        outline=line,
+        width=2,
+    )
+    catcher_w = max(10, int(scale * 7))
+    catcher_h = max(6, int(scale * 4))
+    draw.rectangle(
+        (home[0] - catcher_w // 2, home[1] + box_h, home[0] + catcher_w // 2, home[1] + box_h + catcher_h),
+        outline=line,
+        width=2,
+    )
+
+    return field
 
 
 def normalize_text(text: str) -> str:
@@ -258,37 +484,33 @@ def draw_dashed_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=4, das
     draw_arrow(draw, start, end, color=color, width=width)
 
 
-def scale_point(point, scale_x, scale_y):
-    x, y = point
-    return int(x * scale_x), int(y * scale_y)
-
-
-def annotate_background_image(base_image: Image.Image, row: pd.Series, canvas_width: int, canvas_height: int):
+def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: int):
     text = f"{row.get('Scenario Name', '')}\n{row.get('Description', '')}\n{row.get('Key Question', '')}"
     entities = find_entities(text)
     ball_paths, runner_paths = make_paths_from_text(text, entities)
 
-    annotated = base_image.convert("RGBA").resize((canvas_width, canvas_height))
+    render_scale = max(1, int(RENDER_SUPERSAMPLE))
+    render_width = canvas_width * render_scale
+    render_height = canvas_height * render_scale
+    project, field_scale = build_canvas_projector(render_width, render_height)
+    annotated = draw_field_base(render_width, render_height, project, field_scale)
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    font = ImageFont.load_default()
-    scale_x = canvas_width / BASE_CANVAS_WIDTH
-    scale_y = canvas_height / BASE_CANVAS_HEIGHT
-
+    label_font = load_label_font(15 * render_scale)
     # 每次进入详情页，固定标注全部防守位
     for key in DEFENDER_KEYS:
-        x, y = scale_point(POSITION_COORDS[key], scale_x, scale_y)
-        r = 12
+        x, y = project(key)
+        r = 6 * render_scale
         draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 244, 180, 220), outline=(20, 20, 20, 255), width=2)
-        draw.text((x + 10, y - 10), LABELS[key], fill=(20, 20, 20, 255), font=font)
+        draw_bold_text(draw, (x + 8 * render_scale, y - 12 * render_scale), LABELS[key], font=label_font, fill=(20, 20, 20, 255))
 
     # 额外标注识别到的跑垒员位置
     for runner_key in ["R1", "R2", "R3", "B"]:
         if runner_key in entities and runner_key in POSITION_COORDS:
-            x, y = scale_point(POSITION_COORDS[runner_key], scale_x, scale_y)
-            r = 10
+            x, y = project(runner_key)
+            r = 5 * render_scale
             draw.ellipse((x - r, y - r, x + r, y + r), fill=(180, 230, 255, 220), outline=(20, 20, 20, 255), width=2)
-            draw.text((x + 8, y - 10), LABELS[runner_key], fill=(20, 20, 20, 255), font=font)
+            draw_bold_text(draw, (x + 8 * render_scale, y - 12 * render_scale), LABELS[runner_key], font=label_font, fill=(20, 20, 20, 255))
 
     for src, dst, _kind in ball_paths:
         if src not in POSITION_COORDS or dst not in POSITION_COORDS:
@@ -296,10 +518,10 @@ def annotate_background_image(base_image: Image.Image, row: pd.Series, canvas_wi
         # 红色虚线：球路
         draw_dashed_arrow(
             draw,
-            scale_point(POSITION_COORDS[src], scale_x, scale_y),
-            scale_point(POSITION_COORDS[dst], scale_x, scale_y),
+            project(src),
+            project(dst),
             color=(255, 80, 80, 230),
-            width=4,
+            width=4 * render_scale,
         )
 
     for src, dst, _kind in runner_paths:
@@ -308,13 +530,16 @@ def annotate_background_image(base_image: Image.Image, row: pd.Series, canvas_wi
         # 蓝色实线：跑垒员跑动
         draw_arrow(
             draw,
-            scale_point(POSITION_COORDS[src], scale_x, scale_y),
-            scale_point(POSITION_COORDS[dst], scale_x, scale_y),
+            project(src),
+            project(dst),
             color=(80, 160, 255, 230),
-            width=4,
+            width=4 * render_scale,
         )
-
-    return Image.alpha_composite(annotated, overlay), entities, ball_paths, runner_paths
+    final_image = Image.alpha_composite(annotated, overlay)
+    if render_scale > 1:
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        final_image = final_image.resize((canvas_width, canvas_height), resample=resampling)
+    return final_image, entities, ball_paths, runner_paths
 
 
 def ensure_state():
@@ -322,6 +547,10 @@ def ensure_state():
         st.session_state.selected_id = None
     if "canvas_rev" not in st.session_state:
         st.session_state.canvas_rev = 0
+    if "stroke_width" not in st.session_state:
+        st.session_state.stroke_width = 3
+    if "stroke_color" not in st.session_state:
+        st.session_state.stroke_color = "#ff0000"
 
 
 def show_dashboard(df: pd.DataFrame):
@@ -384,45 +613,117 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         key=f"viewport_width_{scenario_id}",
         want_output=True,
     )
-    # 根据浏览器宽度做响应式计算，给工具栏与边距预留空间
+
+    # 根据浏览器宽度选择布局：宽屏左右分栏，窄屏上下堆叠
+    is_compact_layout = isinstance(viewport_width, (int, float)) and viewport_width < 1100
+
+    # 画布宽度在两种布局下使用不同策略
     if isinstance(viewport_width, (int, float)):
-        canvas_width = int(max(320, min(BASE_CANVAS_WIDTH, viewport_width - 260)))
+        width_ratio = 0.92 if is_compact_layout else 0.68
+        raw_width = int(max(320, min(1200, viewport_width * width_ratio)))
     else:
-        canvas_width = BASE_CANVAS_WIDTH
+        raw_width = BASE_CANVAS_WIDTH
+
+    # 宽度量化：避免浏览器/滚动条带来的 1~几像素抖动，减少背景图反复换 URL
+    width_step = 16
+    candidate_width = max(320, (raw_width // width_step) * width_step)
+
+    width_state_key = f"canvas_width_{scenario_id}"
+    prev_width = st.session_state.get(width_state_key)
+    # 宽度变化时重建画板（以及背景图 + 自动标注）
+    if prev_width is None:
+        st.session_state[width_state_key] = candidate_width
+    elif abs(prev_width - candidate_width) >= width_step:
+        st.session_state[width_state_key] = candidate_width
+        st.session_state.canvas_rev += 1
+
+    canvas_width = st.session_state[width_state_key]
     canvas_height = int(canvas_width * CANVAS_ASPECT_RATIO)
 
-    bg_image = resolve_background_image(row)
     auto_entities = set()
     auto_ball_paths = []
     auto_runner_paths = []
-    if bg_image is None:
-        st.info("未找到战术底图。请将 `baseball-field-diagram.png` 放在项目根目录。")
-    else:
-        bg_image, auto_entities, auto_ball_paths, auto_runner_paths = annotate_background_image(
-            bg_image, row, canvas_width, canvas_height
-        )
+    bg_image, auto_entities, auto_ball_paths, auto_runner_paths = annotate_background_image(
+        row, canvas_width, canvas_height
+    )
 
-    draw_col, tool_col = st.columns([5, 2])
-    with tool_col:
-        stroke_width = st.slider("画笔粗细", 1, 15, 3)
-        stroke_color = st.color_picker("画笔颜色", "#ff0000")
-        if st.button("一键清除画板", use_container_width=True):
-            st.session_state.canvas_rev += 1
-            st.rerun()
-
-    with draw_col:
-        st_canvas(
+    if is_compact_layout:
+        # 窄屏：示意图优先，尽量满宽显示；控件放到下方避免“换行挤压”
+        canvas_result = st_canvas(
             fill_color="rgba(255, 165, 0, 0.2)",
-            stroke_width=stroke_width,
-            stroke_color=stroke_color,
+            stroke_width=st.session_state.stroke_width,
+            stroke_color=st.session_state.stroke_color,
             background_image=bg_image,
-            # 避免每一笔都触发整页重跑，导致背景图媒体 URL 失效
-            update_streamlit=False,
+            update_streamlit=True,
+            display_toolbar=False,
             height=canvas_height,
             width=canvas_width,
             drawing_mode="freedraw",
-            key=f"canvas_{scenario_id}_{st.session_state.canvas_rev}",
+            key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
         )
+        c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
+        with c1:
+            st.session_state.stroke_width = st.slider(
+                "画笔粗细", 1, 15, st.session_state.stroke_width, key=f"stroke_width_{scenario_id}"
+            )
+        with c2:
+            st.session_state.stroke_color = st.color_picker(
+                "画笔颜色", st.session_state.stroke_color, key=f"stroke_color_{scenario_id}"
+            )
+        with c3:
+            if st.button("清空画板", use_container_width=True, key=f"clear_canvas_{scenario_id}"):
+                st.session_state.canvas_rev += 1
+                st.rerun()
+        with c4:
+            if canvas_result is not None and canvas_result.image_data is not None:
+                png_io = io.BytesIO()
+                Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA").save(png_io, format="PNG")
+                st.download_button(
+                    "下载当前标注图(PNG)",
+                    data=png_io.getvalue(),
+                    file_name=f"scenario_{scenario_id:03d}.png",
+                    mime="image/png",
+                    use_container_width=True,
+                    key=f"download_canvas_{scenario_id}",
+                )
+            else:
+                st.caption("下载按钮加载中...")
+    else:
+        draw_col, tool_col = st.columns([5, 2])
+        with tool_col:
+            st.session_state.stroke_width = st.slider(
+                "画笔粗细", 1, 15, st.session_state.stroke_width, key=f"stroke_width_{scenario_id}"
+            )
+            st.session_state.stroke_color = st.color_picker(
+                "画笔颜色", st.session_state.stroke_color, key=f"stroke_color_{scenario_id}"
+            )
+            if st.button("清空画板", use_container_width=True, key=f"clear_canvas_{scenario_id}"):
+                st.session_state.canvas_rev += 1
+                st.rerun()
+
+        with draw_col:
+            canvas_result = st_canvas(
+                fill_color="rgba(255, 165, 0, 0.2)",
+                stroke_width=st.session_state.stroke_width,
+                stroke_color=st.session_state.stroke_color,
+                background_image=bg_image,
+                update_streamlit=True,
+                display_toolbar=False,
+                height=canvas_height,
+                width=canvas_width,
+                drawing_mode="freedraw",
+                key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+            )
+            if canvas_result is not None and canvas_result.image_data is not None:
+                png_io = io.BytesIO()
+                Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA").save(png_io, format="PNG")
+                st.download_button(
+                    "下载当前标注图(PNG)",
+                    data=png_io.getvalue(),
+                    file_name=f"scenario_{scenario_id:03d}.png",
+                    mime="image/png",
+                    key=f"download_canvas_{scenario_id}",
+                )
 
     with st.expander("查看自动标注明细（基于文字规则）", expanded=False):
         if auto_entities:
@@ -472,7 +773,6 @@ def main():
             st.write(f"当前目录: `{Path.cwd()}`")
             st.write(f"应用目录: `{BASE_DIR}`")
             st.write(f"期望数据文件: `{data_file_path}`")
-            st.write(f"期望底图文件: `{DEFAULT_FIELD_IMAGE}`")
         return
 
     df = load_scenarios(data_file_path)

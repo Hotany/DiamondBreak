@@ -2,5 +2,6 @@ streamlit==1.40.0
 pandas
 openpyxl
 streamlit-drawable-canvas
+streamlit-autorefresh
 streamlit-js-eval
 Pillow
