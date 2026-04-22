@@ -615,11 +615,19 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         st.write("若画布空白，请到 Streamlit Cloud Logs 搜索 `drawable-canvas` / `Failed to load component`。")
 
     st.markdown("### 交互式战术板")
-    viewport_width = streamlit_js_eval(
-        js_expressions="window.innerWidth",
-        key=f"viewport_width_{scenario_id}",
-        want_output=True,
-    )
+    # Cloud-safe mode: avoid relying on another custom component before st_canvas.
+    sharing_mode = str(os.environ.get("STREAMLIT_SHARING_MODE", "")).lower()
+    is_cloud = sharing_mode in {"1", "true", "yes"}
+    viewport_width = None
+    if not is_cloud:
+        try:
+            viewport_width = streamlit_js_eval(
+                js_expressions="window.innerWidth",
+                key=f"viewport_width_{scenario_id}",
+                want_output=True,
+            )
+        except Exception:
+            viewport_width = None
 
     # 根据浏览器宽度选择布局：宽屏左右分栏，窄屏上下堆叠
     is_compact_layout = isinstance(viewport_width, (int, float)) and viewport_width < 1100
@@ -656,18 +664,23 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
 
     if is_compact_layout:
         # 窄屏：示意图优先，尽量满宽显示；控件放到下方避免“换行挤压”
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 165, 0, 0.2)",
-            stroke_width=st.session_state.stroke_width,
-            stroke_color=st.session_state.stroke_color,
-            background_image=bg_image,
-            update_streamlit=True,
-            display_toolbar=False,
-            height=canvas_height,
-            width=canvas_width,
-            drawing_mode="freedraw",
-            key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-        )
+        try:
+            canvas_result = st_canvas(
+                fill_color="rgba(255, 165, 0, 0.2)",
+                stroke_width=st.session_state.stroke_width,
+                stroke_color=st.session_state.stroke_color,
+                background_image=bg_image,
+                update_streamlit=True,
+                display_toolbar=False,
+                height=canvas_height,
+                width=canvas_width,
+                drawing_mode="freedraw",
+                key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+            )
+        except Exception as exc:
+            canvas_result = None
+            st.error(f"画板组件加载失败：{exc}")
+            st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
         c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
         with c1:
             st.session_state.stroke_width = st.slider(
@@ -709,18 +722,23 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
                 st.rerun()
 
         with draw_col:
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 165, 0, 0.2)",
-                stroke_width=st.session_state.stroke_width,
-                stroke_color=st.session_state.stroke_color,
-                background_image=bg_image,
-                update_streamlit=True,
-                display_toolbar=False,
-                height=canvas_height,
-                width=canvas_width,
-                drawing_mode="freedraw",
-                key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-            )
+            try:
+                canvas_result = st_canvas(
+                    fill_color="rgba(255, 165, 0, 0.2)",
+                    stroke_width=st.session_state.stroke_width,
+                    stroke_color=st.session_state.stroke_color,
+                    background_image=bg_image,
+                    update_streamlit=True,
+                    display_toolbar=False,
+                    height=canvas_height,
+                    width=canvas_width,
+                    drawing_mode="freedraw",
+                    key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+                )
+            except Exception as exc:
+                canvas_result = None
+                st.error(f"画板组件加载失败：{exc}")
+                st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
             if canvas_result is not None and canvas_result.image_data is not None:
                 png_io = io.BytesIO()
                 Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
