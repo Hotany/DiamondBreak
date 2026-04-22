@@ -3,12 +3,12 @@ import re
 import math
 import io
 import os
+import base64
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
-from streamlit_js_eval import streamlit_js_eval
-from streamlit_drawable_canvas import st_canvas
 
 
 DATA_FILE = Path("datasource01.xlsx")
@@ -544,6 +544,51 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
     return final_image.convert("RGB"), entities, ball_paths, runner_paths
 
 
+def build_plotly_board(background_image: Image.Image, canvas_width: int, canvas_height: int, stroke_color: str, stroke_width: int):
+    png_io = io.BytesIO()
+    background_image.save(png_io, format="PNG")
+    image_uri = "data:image/png;base64," + base64.b64encode(png_io.getvalue()).decode("ascii")
+
+    fig = go.Figure()
+    fig.update_layout(
+        width=canvas_width,
+        height=canvas_height,
+        margin=dict(l=0, r=0, t=0, b=0),
+        dragmode="drawopenpath",
+        newshape=dict(
+            line=dict(color=stroke_color, width=stroke_width),
+        ),
+        images=[
+            dict(
+                source=image_uri,
+                x=0,
+                y=canvas_height,
+                sizex=canvas_width,
+                sizey=canvas_height,
+                xref="x",
+                yref="y",
+                sizing="stretch",
+                layer="below",
+            )
+        ],
+        xaxis=dict(
+            range=[0, canvas_width],
+            visible=False,
+            fixedrange=True,
+        ),
+        yaxis=dict(
+            range=[0, canvas_height],
+            visible=False,
+            fixedrange=True,
+            scaleanchor="x",
+            scaleratio=1,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    return fig
+
+
 def ensure_state():
     if "selected_id" not in st.session_state:
         st.session_state.selected_id = None
@@ -610,30 +655,8 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
     st.write(row["Key Question"] or "（暂无）")
 
     st.markdown("### 交互式战术板")
-    # Default to a single stable rendering path. `streamlit_js_eval` can be re-enabled
-    # explicitly for local experiments, but it is disabled by default to avoid custom
-    # component chaining issues on Streamlit Cloud.
-    enable_js_eval = str(os.environ.get("DIAMONDBREAK_ENABLE_JS_EVAL", "")).lower() in {"1", "true", "yes"}
-    viewport_width = None
-    if enable_js_eval:
-        try:
-            viewport_width = streamlit_js_eval(
-                js_expressions="window.innerWidth",
-                key=f"viewport_width_{scenario_id}",
-                want_output=True,
-            )
-        except Exception:
-            viewport_width = None
-
-    # 根据浏览器宽度选择布局：宽屏左右分栏，窄屏上下堆叠
-    is_compact_layout = isinstance(viewport_width, (int, float)) and viewport_width < 1100
-
-    # 画布宽度在两种布局下使用不同策略
-    if isinstance(viewport_width, (int, float)):
-        width_ratio = 0.92 if is_compact_layout else 0.68
-        raw_width = int(max(320, min(1200, viewport_width * width_ratio)))
-    else:
-        raw_width = BASE_CANVAS_WIDTH
+    is_compact_layout = False
+    raw_width = BASE_CANVAS_WIDTH
 
     # 宽度量化：避免浏览器/滚动条带来的 1~几像素抖动，减少背景图反复换 URL
     width_step = 16
@@ -661,32 +684,12 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
     with st.expander("云端渲染诊断", expanded=False):
         st.write(f"streamlit: `{st.__version__}`")
         st.write(f"streamlit sharing mode: `{os.environ.get('STREAMLIT_SHARING_MODE', 'unknown')}`")
-        st.write(f"js-eval enabled: `{enable_js_eval}`")
+        st.write("render backend: `plotly`")
         st.write(f"canvas size: `{canvas_width} x {canvas_height}`")
-        st.write("下图是服务端直接生成的底图预览；如果它能显示而画板区域空白，问题就在 `st_canvas` 组件挂载。")
+        st.write("下图是服务端直接生成的底图预览；下方交互区使用 Plotly 内置绘图工具栏。")
         st.image(bg_image, caption="服务端底图预览", use_container_width=True)
 
     if is_compact_layout:
-        # 窄屏：示意图优先，尽量满宽显示；控件放到下方避免“换行挤压”
-        try:
-            canvas_result = st_canvas(
-                fill_color="rgba(255, 165, 0, 0.2)",
-                stroke_width=st.session_state.stroke_width,
-                stroke_color=st.session_state.stroke_color,
-                background_image=bg_image,
-                update_streamlit=True,
-                display_toolbar=False,
-                height=canvas_height,
-                width=canvas_width,
-                drawing_mode="freedraw",
-                key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-            )
-        except Exception as exc:
-            canvas_result = None
-            st.error(f"画板组件加载失败：{exc}")
-            st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
-        if canvas_result is None:
-            st.warning("画板组件未返回可用实例，已保留底图预览用于排查。")
         c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
         with c1:
             st.session_state.stroke_width = st.slider(
@@ -701,19 +704,24 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
                 st.session_state.canvas_rev += 1
                 st.rerun()
         with c4:
-            if canvas_result is not None and canvas_result.image_data is not None:
-                png_io = io.BytesIO()
-                Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
-                st.download_button(
-                    "下载当前标注图(PNG)",
-                    data=png_io.getvalue(),
-                    file_name=f"scenario_{scenario_id:03d}.png",
-                    mime="image/png",
-                    use_container_width=True,
-                    key=f"download_canvas_{scenario_id}",
-                )
-            else:
-                st.caption("下载按钮加载中...")
+            st.caption("下载请使用图表右上角相机按钮")
+        fig = build_plotly_board(
+            bg_image,
+            canvas_width,
+            canvas_height,
+            st.session_state.stroke_color,
+            st.session_state.stroke_width,
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
+            },
+            key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+        )
     else:
         draw_col, tool_col = st.columns([5, 2])
         with tool_col:
@@ -726,37 +734,26 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
             if st.button("清空画板", use_container_width=True, key=f"clear_canvas_{scenario_id}"):
                 st.session_state.canvas_rev += 1
                 st.rerun()
+            st.caption("下载请使用图表右上角相机按钮")
 
         with draw_col:
-            try:
-                canvas_result = st_canvas(
-                    fill_color="rgba(255, 165, 0, 0.2)",
-                    stroke_width=st.session_state.stroke_width,
-                    stroke_color=st.session_state.stroke_color,
-                    background_image=bg_image,
-                    update_streamlit=True,
-                    display_toolbar=False,
-                    height=canvas_height,
-                    width=canvas_width,
-                    drawing_mode="freedraw",
-                    key=f"canvas_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-                )
-            except Exception as exc:
-                canvas_result = None
-                st.error(f"画板组件加载失败：{exc}")
-                st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
-            if canvas_result is None:
-                st.warning("画板组件未返回可用实例，已保留底图预览用于排查。")
-            if canvas_result is not None and canvas_result.image_data is not None:
-                png_io = io.BytesIO()
-                Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
-                st.download_button(
-                    "下载当前标注图(PNG)",
-                    data=png_io.getvalue(),
-                    file_name=f"scenario_{scenario_id:03d}.png",
-                    mime="image/png",
-                    key=f"download_canvas_{scenario_id}",
-                )
+            fig = build_plotly_board(
+                bg_image,
+                canvas_width,
+                canvas_height,
+                st.session_state.stroke_color,
+                st.session_state.stroke_width,
+            )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={
+                    "displaylogo": False,
+                    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+                    "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
+                },
+                key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+            )
 
     with st.expander("查看自动标注明细（基于文字规则）", expanded=False):
         if auto_entities:
