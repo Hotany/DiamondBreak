@@ -609,17 +609,13 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
     st.markdown("### 向你提问")
     st.write(row["Key Question"] or "（暂无）")
 
-    with st.expander("云端渲染诊断", expanded=False):
-        st.write(f"streamlit: `{st.__version__}`")
-        st.write(f"streamlit sharing mode: `{os.environ.get('STREAMLIT_SHARING_MODE', 'unknown')}`")
-        st.write("若画布空白，请到 Streamlit Cloud Logs 搜索 `drawable-canvas` / `Failed to load component`。")
-
     st.markdown("### 交互式战术板")
-    # Cloud-safe mode: avoid relying on another custom component before st_canvas.
-    sharing_mode = str(os.environ.get("STREAMLIT_SHARING_MODE", "")).lower()
-    is_cloud = sharing_mode in {"1", "true", "yes"}
+    # Default to a single stable rendering path. `streamlit_js_eval` can be re-enabled
+    # explicitly for local experiments, but it is disabled by default to avoid custom
+    # component chaining issues on Streamlit Cloud.
+    enable_js_eval = str(os.environ.get("DIAMONDBREAK_ENABLE_JS_EVAL", "")).lower() in {"1", "true", "yes"}
     viewport_width = None
-    if not is_cloud:
+    if enable_js_eval:
         try:
             viewport_width = streamlit_js_eval(
                 js_expressions="window.innerWidth",
@@ -662,6 +658,14 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         row, canvas_width, canvas_height
     )
 
+    with st.expander("云端渲染诊断", expanded=False):
+        st.write(f"streamlit: `{st.__version__}`")
+        st.write(f"streamlit sharing mode: `{os.environ.get('STREAMLIT_SHARING_MODE', 'unknown')}`")
+        st.write(f"js-eval enabled: `{enable_js_eval}`")
+        st.write(f"canvas size: `{canvas_width} x {canvas_height}`")
+        st.write("下图是服务端直接生成的底图预览；如果它能显示而画板区域空白，问题就在 `st_canvas` 组件挂载。")
+        st.image(bg_image, caption="服务端底图预览", use_container_width=True)
+
     if is_compact_layout:
         # 窄屏：示意图优先，尽量满宽显示；控件放到下方避免“换行挤压”
         try:
@@ -681,6 +685,8 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
             canvas_result = None
             st.error(f"画板组件加载失败：{exc}")
             st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
+        if canvas_result is None:
+            st.warning("画板组件未返回可用实例，已保留底图预览用于排查。")
         c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
         with c1:
             st.session_state.stroke_width = st.slider(
@@ -739,6 +745,8 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
                 canvas_result = None
                 st.error(f"画板组件加载失败：{exc}")
                 st.image(bg_image, caption="已回退为静态图（云端组件异常）", use_container_width=True)
+            if canvas_result is None:
+                st.warning("画板组件未返回可用实例，已保留底图预览用于排查。")
             if canvas_result is not None and canvas_result.image_data is not None:
                 png_io = io.BytesIO()
                 Image.fromarray(canvas_result.image_data.astype("uint8")).save(png_io, format="PNG")
