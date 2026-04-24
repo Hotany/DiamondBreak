@@ -4,11 +4,17 @@ import math
 import io
 import os
 import base64
+import html
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
+
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:
+    streamlit_js_eval = None
 
 
 DATA_FILE = Path("datasource01.xlsx")
@@ -32,6 +38,12 @@ CANVAS_ASPECT_RATIO = BASE_CANVAS_HEIGHT / BASE_CANVAS_WIDTH
 RENDER_SUPERSAMPLE = 2
 FENCE_SAMPLE_STEP_DEG = 0.5
 BOUNDARY_SAMPLE_STEP_DEG = 1.0
+MIN_CANVAS_WIDTH = 240
+MAX_CONTENT_WIDTH = 600
+PAGE_SIDE_PADDING = 120
+DEFAULT_STROKE_WIDTH = 8
+DEFAULT_STROKE_COLOR = "#901342"
+MARKER_SCALE = 1.3
 
 # 基于棒球常见尺寸（单位：英尺）
 BASE_PATH_FT = 90.0
@@ -54,13 +66,13 @@ POSITION_COORDS = {
     "H": (0.0, 0.0),                         # 本垒
     "B": (0.0, -8.0),                        # 打者
     "C": (0.0, -18.0),                       # 捕手
-    "P": (0.0, PITCH_DISTANCE_FT * BASE_DISTANCE_SCALE),  # 投手（按倍率放大）
+    "P": (0.0, PITCH_DISTANCE_FT * BASE_DISTANCE_SCALE + 12.0),  # 投手略向外场抬高
     "1B": (BASE_COORD_HALF, BASE_COORD_HALF),      # 一垒（放大到 2x）
     "2B": (0.0, 2 * BASE_COORD_HALF),              # 二垒（放大到 2x）
     "3B": (-BASE_COORD_HALF, BASE_COORD_HALF),     # 三垒（放大到 2x）
-    "SS": (-35.0, 95.0),                     # 游击
+    "SS": (-70.0, 170.0),                    # 游击，位于二垒左侧稍远位置
     "LF": (-190.0, 220.0),                   # 左外野
-    "CF": (0.0, 280.0),                      # 中外野
+    "CF": (0.0, 310.0),                      # 中外野更靠外场
     "RF": (190.0, 220.0),                    # 右外野
     "R1": (BASE_COORD_HALF + 8.0, BASE_COORD_HALF + 6.0),
     "R2": (0.0, 2 * BASE_COORD_HALF - 8.0),
@@ -165,16 +177,42 @@ def draw_rotated_square(draw: ImageDraw.ImageDraw, center, size, fill, outline):
 
 
 def load_label_font(size: int):
-    try:
-        return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
-    except Exception:
-        return ImageFont.load_default()
+    font_candidates = [
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/ARIALBD.TTF",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+    ]
+    for font_path in font_candidates:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
 
 
 def draw_bold_text(draw: ImageDraw.ImageDraw, xy, text: str, font, fill):
     x, y = xy
     for dx, dy in [(0, 0), (1, 0), (0, 1), (1, 1)]:
         draw.text((x + dx, y + dy), text, fill=fill, font=font)
+
+
+def draw_centered_text(draw: ImageDraw.ImageDraw, center_x, center_y, text: str, font, fill):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    text_x = center_x - text_w / 2
+    text_y = center_y - text_h / 2 - (4 * MARKER_SCALE)
+    draw_bold_text(draw, (text_x, text_y), text, font=font, fill=fill)
+
+
+def draw_centered_label(draw: ImageDraw.ImageDraw, center_x, top_y, text: str, font, fill):
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_x = center_x - text_w / 2
+    draw_bold_text(draw, (text_x, top_y), text, font=font, fill=fill)
 
 
 def scale_polygon(points, center, scale):
@@ -497,21 +535,35 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
     annotated = draw_field_base(render_width, render_height, project, field_scale)
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    label_font = load_label_font(15 * render_scale)
+    label_font = load_label_font(int(12 * MARKER_SCALE * render_scale))
     # 每次进入详情页，固定标注全部防守位
     for key in DEFENDER_KEYS:
         x, y = project(key)
-        r = 6 * render_scale
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 244, 180, 220), outline=(20, 20, 20, 255), width=2)
-        draw_bold_text(draw, (x + 8 * render_scale, y - 12 * render_scale), LABELS[key], font=label_font, fill=(20, 20, 20, 255))
+        r = 12 * MARKER_SCALE * render_scale
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 255), outline=(40, 40, 40, 255), width=2)
+        draw_centered_text(
+            draw,
+            x,
+            y,
+            LABELS[key],
+            font=label_font,
+            fill=(22, 43, 77, 204),
+        )
 
     # 额外标注识别到的跑垒员位置
     for runner_key in ["R1", "R2", "R3", "B"]:
         if runner_key in entities and runner_key in POSITION_COORDS:
             x, y = project(runner_key)
-            r = 5 * render_scale
-            draw.ellipse((x - r, y - r, x + r, y + r), fill=(180, 230, 255, 220), outline=(20, 20, 20, 255), width=2)
-            draw_bold_text(draw, (x + 8 * render_scale, y - 12 * render_scale), LABELS[runner_key], font=label_font, fill=(20, 20, 20, 255))
+            r = 10 * MARKER_SCALE * render_scale
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 255), outline=(40, 40, 40, 255), width=2)
+            draw_centered_text(
+                draw,
+                x,
+                y,
+                LABELS[runner_key],
+                font=label_font,
+                fill=(22, 43, 77, 204),
+            )
 
     for src, dst, _kind in ball_paths:
         if src not in POSITION_COORDS or dst not in POSITION_COORDS:
@@ -589,15 +641,49 @@ def build_plotly_board(background_image: Image.Image, canvas_width: int, canvas_
     return fig
 
 
+def get_viewport_width():
+    fallback_width = BASE_CANVAS_WIDTH + PAGE_SIDE_PADDING
+
+    if streamlit_js_eval is None:
+        return st.session_state.get("last_viewport_width", fallback_width)
+
+    viewport_width = streamlit_js_eval(
+        js_expressions="window.innerWidth",
+        key="diamondbreak_viewport_width",
+    )
+    if isinstance(viewport_width, int) and viewport_width > 0:
+        st.session_state["last_viewport_width"] = viewport_width
+        return viewport_width
+
+    return st.session_state.get("last_viewport_width", fallback_width)
+
+
+def apply_page_width_style():
+    st.markdown(
+        f"""
+        <style>
+        .block-container {{
+            max-width: {MAX_CONTENT_WIDTH}px !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def ensure_state():
     if "selected_id" not in st.session_state:
         st.session_state.selected_id = None
     if "canvas_rev" not in st.session_state:
         st.session_state.canvas_rev = 0
     if "stroke_width" not in st.session_state:
-        st.session_state.stroke_width = 3
+        st.session_state.stroke_width = DEFAULT_STROKE_WIDTH
     if "stroke_color" not in st.session_state:
-        st.session_state.stroke_color = "#ff0000"
+        st.session_state.stroke_color = DEFAULT_STROKE_COLOR
 
 
 def show_dashboard(df: pd.DataFrame):
@@ -639,28 +725,33 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
 
     row = row_df.iloc[0]
     title = row["Scenario Name"] or f"场景 {row['ID']}"
+    combined_text = "\n\n".join(
+        [part for part in [row["Description"].strip(), row["Key Question"].strip()] if part]
+    ) or "（暂无）"
+    combined_text_html = html.escape(combined_text).replace("\n", "<br>")
 
-    c1, c2 = st.columns([1, 5])
-    with c1:
-        if st.button("返回列表"):
-            st.session_state.selected_id = None
-            st.rerun()
-    with c2:
-        st.subheader(f"#{row['ID']:03d} {title}")
+    if st.button("返回列表"):
+        st.session_state.selected_id = None
+        st.rerun()
 
-    st.write(f"Category: {row['Category'] or '未分类'}")
-    st.markdown("### 局面描述")
-    st.write(row["Description"] or "（暂无）")
-    st.markdown("### 向你提问")
-    st.write(row["Key Question"] or "（暂无）")
+    st.subheader(title)
+    st.markdown("<div style='font-size: 1.1rem; font-weight: 600; margin-top: 0.25rem; margin-bottom: 0.35rem;'>局面描述</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='font-size: 1.06rem; line-height: 1.8;'>{combined_text_html}</div>",
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("### 交互式战术板")
-    is_compact_layout = False
-    raw_width = BASE_CANVAS_WIDTH
+    st.markdown("<div style='height: 0.9rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size: 1.1rem; font-weight: 600; margin-top: 0; margin-bottom: 6px;'>交互式战术板</div>", unsafe_allow_html=True)
+    viewport_width = get_viewport_width()
+    available_width = max(MIN_CANVAS_WIDTH, viewport_width - PAGE_SIDE_PADDING)
+    raw_width = min(MAX_CONTENT_WIDTH, available_width)
+    st.session_state.stroke_width = DEFAULT_STROKE_WIDTH
+    st.session_state.stroke_color = DEFAULT_STROKE_COLOR
 
     # 宽度量化：避免浏览器/滚动条带来的 1~几像素抖动，减少背景图反复换 URL
     width_step = 16
-    candidate_width = max(320, (raw_width // width_step) * width_step)
+    candidate_width = max(MIN_CANVAS_WIDTH, (raw_width // width_step) * width_step)
 
     width_state_key = f"canvas_width_{scenario_id}"
     prev_width = st.session_state.get(width_state_key)
@@ -672,7 +763,7 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         st.session_state.canvas_rev += 1
 
     canvas_width = st.session_state[width_state_key]
-    canvas_height = int(canvas_width * CANVAS_ASPECT_RATIO)
+    canvas_height = canvas_width
 
     auto_entities = set()
     auto_ball_paths = []
@@ -681,107 +772,36 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         row, canvas_width, canvas_height
     )
 
-    with st.expander("云端渲染诊断", expanded=False):
-        st.write(f"streamlit: `{st.__version__}`")
-        st.write(f"streamlit sharing mode: `{os.environ.get('STREAMLIT_SHARING_MODE', 'unknown')}`")
-        st.write("render backend: `plotly`")
-        st.write(f"canvas size: `{canvas_width} x {canvas_height}`")
-        st.write("下图是服务端直接生成的底图预览；下方交互区使用 Plotly 内置绘图工具栏。")
-        st.image(bg_image, caption="服务端底图预览", use_container_width=True)
+    fig = build_plotly_board(
+        bg_image,
+        canvas_width,
+        canvas_height,
+        st.session_state.stroke_color,
+        st.session_state.stroke_width,
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "displaylogo": False,
+            "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
+            "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
+        },
+        key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
+    )
+    st.markdown(
+        "<div style='text-align: center; color: rgb(80, 80, 80); font-size: 0.92rem; margin: 6px 0 20px 0;'>"
+        "下载请使用绘图区域右上角的相机按钮"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-    if is_compact_layout:
-        c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
-        with c1:
-            st.session_state.stroke_width = st.slider(
-                "画笔粗细", 1, 15, st.session_state.stroke_width, key=f"stroke_width_{scenario_id}"
-            )
-        with c2:
-            st.session_state.stroke_color = st.color_picker(
-                "画笔颜色", st.session_state.stroke_color, key=f"stroke_color_{scenario_id}"
-            )
-        with c3:
-            if st.button("清空画板", use_container_width=True, key=f"clear_canvas_{scenario_id}"):
-                st.session_state.canvas_rev += 1
-                st.rerun()
-        with c4:
-            st.caption("下载请使用图表右上角相机按钮")
-        fig = build_plotly_board(
-            bg_image,
-            canvas_width,
-            canvas_height,
-            st.session_state.stroke_color,
-            st.session_state.stroke_width,
-        )
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={
-                "displaylogo": False,
-                "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
-            },
-            key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-        )
-    else:
-        draw_col, tool_col = st.columns([5, 2])
-        with tool_col:
-            st.session_state.stroke_width = st.slider(
-                "画笔粗细", 1, 15, st.session_state.stroke_width, key=f"stroke_width_{scenario_id}"
-            )
-            st.session_state.stroke_color = st.color_picker(
-                "画笔颜色", st.session_state.stroke_color, key=f"stroke_color_{scenario_id}"
-            )
-            if st.button("清空画板", use_container_width=True, key=f"clear_canvas_{scenario_id}"):
-                st.session_state.canvas_rev += 1
-                st.rerun()
-            st.caption("下载请使用图表右上角相机按钮")
-
-        with draw_col:
-            fig = build_plotly_board(
-                bg_image,
-                canvas_width,
-                canvas_height,
-                st.session_state.stroke_color,
-                st.session_state.stroke_width,
-            )
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                config={
-                    "displaylogo": False,
-                    "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
-                    "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
-                },
-                key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
-            )
-
-    with st.expander("查看自动标注明细（基于文字规则）", expanded=False):
-        if auto_entities:
-            st.write("已标注人员/位置:", ", ".join(sorted(auto_entities)))
-        else:
-            st.write("已标注人员/位置: 无")
-
-        if auto_ball_paths:
-            st.write("已标注球路（红色虚线）:")
-            for src, dst, _ in auto_ball_paths:
-                st.write(f"- 球路: {src} -> {dst}")
-        else:
-            st.write("已标注球路: 无")
-
-        if auto_runner_paths:
-            st.write("已标注跑垒线路（蓝色实线）:")
-            for src, dst, _ in auto_runner_paths:
-                st.write(f"- 跑垒: {src} -> {dst}")
-        else:
-            st.write("已标注跑垒线路: 无")
-
-    st.markdown("### 解析与反馈")
     flag_key = f"show_analysis_{scenario_id}"
     if flag_key not in st.session_state:
         st.session_state[flag_key] = False
 
     if not st.session_state[flag_key]:
-        if st.button("查看解析"):
+        if st.button("查看解析", use_container_width=True):
             st.session_state[flag_key] = True
             st.rerun()
     else:
@@ -794,6 +814,7 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
 
 def main():
     st.set_page_config(page_title="Baseball Tactical Trainer", layout="wide")
+    apply_page_width_style()
     ensure_state()
 
     data_file_path = BASE_DIR / DATA_FILE

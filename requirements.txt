@@ -3,3 +3,6 @@ pandas
 openpyxl
 Pillow
 plotly
+matplotlib
+numpy
+streamlit-js-eval
