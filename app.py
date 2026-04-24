@@ -70,10 +70,10 @@ POSITION_COORDS = {
     "1B": (BASE_COORD_HALF, BASE_COORD_HALF),      # 一垒（放大到 2x）
     "2B": (0.0, 2 * BASE_COORD_HALF),              # 二垒（放大到 2x）
     "3B": (-BASE_COORD_HALF, BASE_COORD_HALF),     # 三垒（放大到 2x）
-    "SS": (-70.0, 170.0),                    # 游击，位于二垒左侧稍远位置
-    "LF": (-190.0, 220.0),                   # 左外野
-    "CF": (0.0, 310.0),                      # 中外野更靠外场
-    "RF": (190.0, 220.0),                    # 右外野
+    "SS": (-70.0, 195.5),                    # 游击上提约 15%
+    "LF": (-190.0, 242.0),                   # 左外野上提约 10%
+    "CF": (0.0, 341.0),                      # 中外野上提约 10%
+    "RF": (190.0, 242.0),                    # 右外野上提约 10%
     "R1": (BASE_COORD_HALF + 8.0, BASE_COORD_HALF + 6.0),
     "R2": (0.0, 2 * BASE_COORD_HALF - 8.0),
     "R3": (-BASE_COORD_HALF - 8.0, BASE_COORD_HALF + 6.0),
@@ -215,6 +215,27 @@ def draw_centered_label(draw: ImageDraw.ImageDraw, center_x, top_y, text: str, f
     draw_bold_text(draw, (text_x, top_y), text, font=font, fill=fill)
 
 
+def marker_radius_for_key(key: str, render_scale: int):
+    if key in DEFENDER_KEYS:
+        return 12 * MARKER_SCALE * render_scale
+    if key in {"R1", "R2", "R3", "B"}:
+        return 10 * MARKER_SCALE * render_scale
+    return 0
+
+
+def trim_path_to_marker_edges(start, end, start_radius=0, end_radius=0):
+    sx, sy = start
+    ex, ey = end
+    dx, dy = ex - sx, ey - sy
+    length = max((dx * dx + dy * dy) ** 0.5, 1.0)
+    ux, uy = dx / length, dy / length
+    safe_start_radius = min(start_radius, length * 0.4)
+    safe_end_radius = min(end_radius, length * 0.4)
+    trimmed_start = (sx + ux * safe_start_radius, sy + uy * safe_start_radius)
+    trimmed_end = (ex - ux * safe_end_radius, ey - uy * safe_end_radius)
+    return trimmed_start, trimmed_end
+
+
 def scale_polygon(points, center, scale):
     cx, cy = center
     return [(cx + (x - cx) * scale, cy + (y - cy) * scale) for x, y in points]
@@ -243,7 +264,16 @@ def fan_point_ft(theta_deg: float, radius_ft: float, curvature_scale: float):
 
 
 def build_canvas_projector(canvas_width: int, canvas_height: int):
-    field_points = list(POSITION_COORDS.values())
+    # 投影边界只按球场本体计算，不把守备站位一起算进去，避免球场被整体缩小。
+    field_points = [
+        POSITION_COORDS["H"],
+        POSITION_COORDS["B"],
+        POSITION_COORDS["C"],
+        POSITION_COORDS["P"],
+        POSITION_COORDS["1B"],
+        POSITION_COORDS["2B"],
+        POSITION_COORDS["3B"],
+    ]
     # 加入外场围栏采样点，确保整个球场轮廓都在可视正方形内
     for deg in sample_angles(-45.0, 45.0, BOUNDARY_SAMPLE_STEP_DEG):
         x, y = outfield_point_ft(float(deg))
@@ -258,7 +288,7 @@ def build_canvas_projector(canvas_width: int, canvas_height: int):
     content_h = max(max_y - min_y, 1.0)
     content_size = max(content_w, content_h)
 
-    padding = 24
+    padding = int(min(canvas_width, canvas_height) * 0.06)
     square_size = max(220.0, min(canvas_width, canvas_height) - padding * 2)
     scale = square_size / content_size
 
@@ -432,6 +462,31 @@ def find_destinations(text: str):
     return destinations
 
 
+def find_ordered_position_mentions(text: str):
+    normalized = normalize_text(text)
+    mentions = []
+    pattern_map = {}
+    for key, patterns in {**ENTITY_PATTERNS, **DEST_PATTERNS}.items():
+        for pattern in patterns:
+            pattern_map.setdefault(pattern, key)
+
+    for pattern, key in pattern_map.items():
+        start = 0
+        while True:
+            idx = normalized.find(pattern, start)
+            if idx == -1:
+                break
+            mentions.append((idx, key))
+            start = idx + len(pattern)
+
+    mentions.sort(key=lambda item: item[0])
+    ordered_keys = []
+    for _, key in mentions:
+        if not ordered_keys or ordered_keys[-1] != key:
+            ordered_keys.append(key)
+    return ordered_keys
+
+
 def make_paths_from_text(text: str, entities: set):
     normalized = normalize_text(text)
     destinations = find_destinations(text)
@@ -452,21 +507,31 @@ def make_paths_from_text(text: str, entities: set):
             ball_paths.append(("B", dst, "球路"))
             break
 
-    # 回退逻辑：如果有击球语义但没命中细分规则，就用第一个防守区域目标
-    if not ball_paths and any(v in normalized for v in ["击向", "飞向", "飞球", "地滚球", "平飞球"]):
-        for d in destinations:
-            if d in {"SS", "LF", "CF", "RF", "3B", "2B", "1B"}:
-                ball_paths.append(("B", d, "球路"))
+    fielder_catch_patterns = [
+        (r"(游击手|游击|ss).*(接到球|接球|接住|拿到球|处理)", "SS"),
+        (r"(三垒手|三垒|3垒|3b).*(接到球|接球|接住|拿到球|处理)", "3B"),
+        (r"(二垒手|二垒|2垒|2b).*(接到球|接球|接住|拿到球|处理)", "2B"),
+        (r"(一垒手|一垒|1垒|1b).*(接到球|接球|接住|拿到球|处理)", "1B"),
+        (r"(左外野手|左外野|lf).*(接到球|接球|接住|拿到球|处理)", "LF"),
+        (r"(中外野手|中外野|cf).*(接到球|接球|接住|拿到球|处理)", "CF"),
+        (r"(右外野手|右外野|rf).*(接到球|接球|接住|拿到球|处理)", "RF"),
+    ]
+    if not ball_paths:
+        for pattern, dst in fielder_catch_patterns:
+            if re.search(pattern, normalized):
+                ball_paths.append(("B", dst, "球路"))
                 break
 
-    # 传球线路：防守球员 -> 目标垒位/区域（也按球路处理）
-    if any(v in normalized for v in ["传向", "传到", "传回", "传给"]):
-        source_priority = ["C", "P", "SS", "3B", "2B", "1B", "LF", "CF", "RF"]
-        source = next((s for s in source_priority if s in entities), None)
-        if source:
+    # 回退逻辑：如果有击球语义但没命中细分规则，就用第一个防守区域目标
+    if not ball_paths and any(v in normalized for v in ["击向", "飞向", "飞球", "地滚球", "平飞球"]):
+        defender_priority = ["SS", "3B", "2B", "1B", "LF", "CF", "RF"]
+        picked = next((k for k in defender_priority if k in entities), None)
+        if picked:
+            ball_paths.append(("B", picked, "球路"))
+        else:
             for d in destinations:
-                if d != source:
-                    ball_paths.append((source, d, "球路"))
+                if d in {"SS", "LF", "CF", "RF", "3B", "2B", "1B"}:
+                    ball_paths.append(("B", d, "球路"))
                     break
 
     # 跑垒线路：蓝色实线
@@ -490,18 +555,68 @@ def make_paths_from_text(text: str, entities: set):
     return ball_paths, runner_paths
 
 
+def make_throw_paths_from_text(text: str, entities: set, fallback_source: str | None = None):
+    normalized = normalize_text(text)
+    throw_paths = []
+    has_throw_verbs = any(v in normalized for v in ["传向", "传到", "传回", "传给", "回传", "再传", "转传"])
+    answer_destinations = find_destinations(text)
+
+    if has_throw_verbs:
+        ordered_mentions = find_ordered_position_mentions(text)
+        valid_throw_nodes = {"C", "P", "SS", "3B", "2B", "1B", "LF", "CF", "RF", "H"}
+        ordered_mentions = [key for key in ordered_mentions if key in valid_throw_nodes]
+
+        for src, dst in zip(ordered_mentions, ordered_mentions[1:]):
+            if src != dst:
+                throw_paths.append((src, dst, "传球"))
+
+    # 回退逻辑：像“正确答案：一垒”这种只写目标垒位的情况，
+    # 用题面识别到的最后接球守备员作为传球起点。
+    if not throw_paths and fallback_source:
+        for dst in answer_destinations:
+            if dst in {"1B", "2B", "3B", "H"} and dst != fallback_source:
+                throw_paths.append((fallback_source, dst, "传球"))
+                break
+
+    deduped_paths = []
+    seen = set()
+    for path in throw_paths:
+        if path[:2] not in seen:
+            seen.add(path[:2])
+            deduped_paths.append(path)
+    return deduped_paths
+
+
 def draw_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=4):
     draw.line([start, end], fill=color, width=width)
+    draw_arrow_head(draw, start, end, color)
+
+
+def draw_arrow_head(draw: ImageDraw.ImageDraw, start, end, color, size: int = 10):
     ex, ey = end
     sx, sy = start
     dx, dy = ex - sx, ey - sy
     length = max((dx * dx + dy * dy) ** 0.5, 1.0)
     ux, uy = dx / length, dy / length
     px, py = -uy, ux
-    size = 10
     p1 = (ex - ux * size + px * (size * 0.6), ey - uy * size + py * (size * 0.6))
     p2 = (ex - ux * size - px * (size * 0.6), ey - uy * size - py * (size * 0.6))
     draw.polygon([end, p1, p2], fill=color)
+
+
+def draw_arrow_with_outline(
+    draw: ImageDraw.ImageDraw,
+    start,
+    end,
+    color,
+    width=4,
+    outline_color=(255, 214, 10, 230),
+    outline_extra_width=3,
+):
+    draw.line([start, end], fill=outline_color, width=width + outline_extra_width)
+    draw.line([start, end], fill=color, width=width)
+    draw_arrow_head(draw, start, end, outline_color, size=int(10 + outline_extra_width))
+    draw_arrow_head(draw, start, end, color, size=10)
 
 
 def draw_dashed_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=4, dash=12, gap=8):
@@ -520,13 +635,54 @@ def draw_dashed_arrow(draw: ImageDraw.ImageDraw, start, end, color, width=4, das
         y2 = sy + dy * e_ratio
         draw.line([(x1, y1), (x2, y2)], fill=color, width=width)
         dist += step
-    draw_arrow(draw, start, end, color=color, width=width)
+    draw_arrow_head(draw, start, end, color=color)
 
 
-def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: int):
+def draw_dashed_arrow_with_outline(
+    draw: ImageDraw.ImageDraw,
+    start,
+    end,
+    color,
+    width=4,
+    dash=12,
+    gap=8,
+    outline_color=(30, 30, 30, 220),
+    outline_extra_width=3,
+):
+    draw_dashed_arrow(
+        draw,
+        start,
+        end,
+        color=outline_color,
+        width=width + outline_extra_width,
+        dash=dash,
+        gap=gap,
+    )
+    draw_dashed_arrow(
+        draw,
+        start,
+        end,
+        color=color,
+        width=width,
+        dash=dash,
+        gap=gap,
+    )
+
+
+def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: int, show_answer_paths: bool = False):
     text = f"{row.get('Scenario Name', '')}\n{row.get('Description', '')}\n{row.get('Key Question', '')}"
     entities = find_entities(text)
     ball_paths, runner_paths = make_paths_from_text(text, entities)
+    correct_answer_text = row.get("Correct Answer", "")
+    coach_tip_text = row.get("Coach's Tip", "")
+    answer_text = f"{correct_answer_text}\n{coach_tip_text}"
+    answer_entities = find_entities(answer_text)
+    fallback_throw_source = ball_paths[-1][1] if ball_paths else None
+    throw_paths = (
+        make_throw_paths_from_text(answer_text, answer_entities, fallback_source=fallback_throw_source)
+        if show_answer_paths
+        else []
+    )
 
     render_scale = max(1, int(RENDER_SUPERSAMPLE))
     render_width = canvas_width * render_scale
@@ -568,32 +724,67 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
     for src, dst, _kind in ball_paths:
         if src not in POSITION_COORDS or dst not in POSITION_COORDS:
             continue
-        # 红色虚线：球路
-        draw_dashed_arrow(
-            draw,
+        # 明黄虚线 + 深色描边：球路
+        start_point, end_point = trim_path_to_marker_edges(
             project(src),
             project(dst),
-            color=(255, 80, 80, 230),
+            marker_radius_for_key(src, render_scale),
+            marker_radius_for_key(dst, render_scale),
+        )
+        draw_dashed_arrow_with_outline(
+            draw,
+            start_point,
+            end_point,
+            color=(255, 222, 0, 230),
             width=4 * render_scale,
+            outline_color=(70, 55, 0, 230),
+            outline_extra_width=3 * render_scale,
         )
 
     for src, dst, _kind in runner_paths:
         if src not in POSITION_COORDS or dst not in POSITION_COORDS:
             continue
-        # 蓝色实线：跑垒员跑动
-        draw_arrow(
-            draw,
+        # 亮青蓝虚线 + 黑色描边：跑垒员跑动
+        start_point, end_point = trim_path_to_marker_edges(
             project(src),
             project(dst),
-            color=(80, 160, 255, 230),
+            marker_radius_for_key(src, render_scale),
+            marker_radius_for_key(dst, render_scale),
+        )
+        draw_dashed_arrow_with_outline(
+            draw,
+            start_point,
+            end_point,
+            color=(0, 255, 255, 245),
             width=4 * render_scale,
+            outline_color=(0, 0, 0, 230),
+            outline_extra_width=3 * render_scale,
+        )
+
+    for src, dst, _kind in throw_paths:
+        if src not in POSITION_COORDS or dst not in POSITION_COORDS:
+            continue
+        start_point, end_point = trim_path_to_marker_edges(
+            project(src),
+            project(dst),
+            marker_radius_for_key(src, render_scale),
+            marker_radius_for_key(dst, render_scale),
+        )
+        draw_arrow_with_outline(
+            draw,
+            start_point,
+            end_point,
+            color=(210, 30, 30, 235),
+            width=4 * render_scale,
+            outline_color=(255, 214, 10, 230),
+            outline_extra_width=3 * render_scale,
         )
     final_image = Image.alpha_composite(annotated, overlay)
     if render_scale > 1:
         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
         final_image = final_image.resize((canvas_width, canvas_height), resample=resampling)
     # Cloud compatibility: drawable-canvas is more stable with RGB than RGBA backgrounds.
-    return final_image.convert("RGB"), entities, ball_paths, runner_paths
+    return final_image.convert("RGB"), entities, ball_paths, runner_paths, throw_paths
 
 
 def build_plotly_board(background_image: Image.Image, canvas_width: int, canvas_height: int, stroke_color: str, stroke_width: int):
@@ -605,6 +796,7 @@ def build_plotly_board(background_image: Image.Image, canvas_width: int, canvas_
     fig.update_layout(
         width=canvas_width,
         height=canvas_height,
+        autosize=False,
         margin=dict(l=0, r=0, t=0, b=0),
         dragmode="drawopenpath",
         newshape=dict(
@@ -729,10 +921,20 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         [part for part in [row["Description"].strip(), row["Key Question"].strip()] if part]
     ) or "（暂无）"
     combined_text_html = html.escape(combined_text).replace("\n", "<br>")
+    flag_key = f"show_analysis_{scenario_id}"
+    if flag_key not in st.session_state:
+        st.session_state[flag_key] = False
 
-    if st.button("返回列表"):
-        st.session_state.selected_id = None
-        st.rerun()
+    header_c1, header_c2 = st.columns([1, 4])
+    with header_c1:
+        if st.button("返回列表"):
+            st.session_state.selected_id = None
+            st.rerun()
+    with header_c2:
+        st.markdown(
+            f"<div style='color: #a6a6a6; font-size: 1.06rem; line-height: 2.2;'>#{scenario_id:03d}</div>",
+            unsafe_allow_html=True,
+        )
 
     st.subheader(title)
     st.markdown("<div style='font-size: 1.1rem; font-weight: 600; margin-top: 0.25rem; margin-bottom: 0.35rem;'>局面描述</div>", unsafe_allow_html=True)
@@ -768,8 +970,9 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
     auto_entities = set()
     auto_ball_paths = []
     auto_runner_paths = []
-    bg_image, auto_entities, auto_ball_paths, auto_runner_paths = annotate_background_image(
-        row, canvas_width, canvas_height
+    auto_throw_paths = []
+    bg_image, auto_entities, auto_ball_paths, auto_runner_paths, auto_throw_paths = annotate_background_image(
+        row, canvas_width, canvas_height, show_answer_paths=st.session_state[flag_key]
     )
 
     fig = build_plotly_board(
@@ -786,6 +989,7 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
             "displaylogo": False,
             "modeBarButtonsToAdd": ["drawline", "drawopenpath", "eraseshape"],
             "toImageButtonOptions": {"format": "png", "filename": f"scenario_{scenario_id:03d}"},
+            "responsive": False,
         },
         key=f"plotly_board_{scenario_id}_{canvas_width}_{st.session_state.canvas_rev}",
     )
@@ -795,10 +999,6 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         "</div>",
         unsafe_allow_html=True,
     )
-
-    flag_key = f"show_analysis_{scenario_id}"
-    if flag_key not in st.session_state:
-        st.session_state[flag_key] = False
 
     if not st.session_state[flag_key]:
         if st.button("查看解析", use_container_width=True):
