@@ -16,6 +16,43 @@ try:
 except Exception:
     streamlit_js_eval = None
 
+try:
+    from BaseballFieldPro import BaseballFieldPro
+    BASEBALL_FIELD_PRO_IMPORT_ERROR = None
+except Exception as exc:
+    BaseballFieldPro = None
+    BASEBALL_FIELD_PRO_IMPORT_ERROR = exc
+
+
+def render_fieldpro_background(canvas_width: int, canvas_height: int, render_scale: int):
+    if BaseballFieldPro is None:
+        raise RuntimeError(f"BaseballFieldPro import failed: {BASEBALL_FIELD_PRO_IMPORT_ERROR}")
+
+    dpi = 120
+    px_w = int(canvas_width * render_scale)
+    px_h = int(canvas_height * render_scale)
+
+    field = BaseballFieldPro(size=max(px_w, px_h) / dpi)
+    fig = field.draw(players=None)
+    try:
+        fig.set_size_inches(px_w / dpi, px_h / dpi)
+        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        ax = fig.axes[0]
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, facecolor=fig.get_facecolor(), bbox_inches=None, pad_inches=0)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGBA")
+        return img, xlim, ylim, field.compute_layout()
+    finally:
+        try:
+            import matplotlib.pyplot as plt
+
+            plt.close(fig)
+        except Exception:
+            pass
+
 
 DATA_FILE = Path("datasource01.xlsx")
 BASE_DIR = Path(__file__).resolve().parent
@@ -687,13 +724,33 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
     render_scale = max(1, int(RENDER_SUPERSAMPLE))
     render_width = canvas_width * render_scale
     render_height = canvas_height * render_scale
-    project, field_scale = build_canvas_projector(render_width, render_height)
-    annotated = draw_field_base(render_width, render_height, project, field_scale)
+
+    base_img, xlim, ylim, field_layout = render_fieldpro_background(canvas_width, canvas_height, render_scale)
+    annotated = base_img
     overlay = Image.new("RGBA", annotated.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
+
+    coords = dict(field_layout.get("coords", {}))
+    if "1B" in coords:
+        coords["R1"] = (coords["1B"][0] + 10 * render_scale, coords["1B"][1] + 8 * render_scale)
+    if "2B" in coords:
+        coords["R2"] = (coords["2B"][0], coords["2B"][1] - 10 * render_scale)
+    if "3B" in coords:
+        coords["R3"] = (coords["3B"][0] - 10 * render_scale, coords["3B"][1] + 8 * render_scale)
+
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    y0, y1 = float(ylim[0]), float(ylim[1])
+
+    def project(key: str):
+        x, y = coords[key]
+        px = (x - x0) / (x1 - x0) * render_width
+        py = (y1 - y) / (y1 - y0) * render_height
+        return (px, py)
     label_font = load_label_font(int(12 * MARKER_SCALE * render_scale))
     # 每次进入详情页，固定标注全部防守位
     for key in DEFENDER_KEYS:
+        if key not in coords:
+            continue
         x, y = project(key)
         r = 12 * MARKER_SCALE * render_scale
         draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 255), outline=(40, 40, 40, 255), width=2)
@@ -708,7 +765,7 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
 
     # 额外标注识别到的跑垒员位置
     for runner_key in ["R1", "R2", "R3", "B"]:
-        if runner_key in entities and runner_key in POSITION_COORDS:
+        if runner_key in entities and runner_key in coords:
             x, y = project(runner_key)
             r = 10 * MARKER_SCALE * render_scale
             draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 255, 255, 255), outline=(40, 40, 40, 255), width=2)
@@ -722,7 +779,7 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
             )
 
     for src, dst, _kind in ball_paths:
-        if src not in POSITION_COORDS or dst not in POSITION_COORDS:
+        if src not in coords or dst not in coords:
             continue
         # 明黄虚线 + 深色描边：球路
         start_point, end_point = trim_path_to_marker_edges(
@@ -742,7 +799,7 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
         )
 
     for src, dst, _kind in runner_paths:
-        if src not in POSITION_COORDS or dst not in POSITION_COORDS:
+        if src not in coords or dst not in coords:
             continue
         # 亮青蓝虚线 + 黑色描边：跑垒员跑动
         start_point, end_point = trim_path_to_marker_edges(
@@ -762,7 +819,7 @@ def annotate_background_image(row: pd.Series, canvas_width: int, canvas_height: 
         )
 
     for src, dst, _kind in throw_paths:
-        if src not in POSITION_COORDS or dst not in POSITION_COORDS:
+        if src not in coords or dst not in coords:
             continue
         start_point, end_point = trim_path_to_marker_edges(
             project(src),
@@ -1010,6 +1067,8 @@ def show_detail(df: pd.DataFrame, scenario_id: int):
         st.write(row["Correct Answer"] or "（暂无）")
         st.markdown("**Coach's Tip**")
         st.write(row["Coach's Tip"] or "（暂无）")
+
+
 
 
 def main():
